@@ -115,7 +115,7 @@ impl SyncManager {
         self.peers.insert(peer_id, status);
     }
 
-    pub fn remove_peer(&mut self, peer_id: &PeerId) -> Vec<SyncBatch> {
+    pub fn remove_peer(&mut self, peer_id: &PeerId) -> Vec<(RequestId, SyncBatch)> {
         self.log_with_feature(format_args!("remove peer (peer_id: {peer_id})"));
         self.peers.remove(peer_id);
 
@@ -127,18 +127,20 @@ impl SyncManager {
     }
 
     pub fn get_request_by_id(&mut self, request_id: RequestId) -> Option<SyncBatch> {
-        self.log_with_feature(format_args!("getting request (request_id: {request_id})"));
-
         self.block_requests
             .get_request_by_id(request_id)
             .or(self.blob_requests.get_request_by_id(request_id))
             .or(self.data_column_requests.get_request_by_id(request_id))
     }
 
-    pub fn retry_batch(&mut self, request_id: RequestId, batch: SyncBatch) {
+    pub fn retry_batch(
+        &mut self,
+        old_request_id: RequestId,
+        request_id: RequestId,
+        batch: SyncBatch,
+    ) {
         self.log_with_feature(format_args!(
-            "retrying batch {batch:?}, new peer: {}, request_id: {request_id}",
-            batch.peer_id,
+            "retrying request_id: {old_request_id} with (request_id: {request_id}, batch {batch:?})",
         ));
 
         let target = batch.target.clone();
@@ -279,6 +281,7 @@ impl SyncManager {
         };
 
         // filter out peers with less head slot than `sync_start_slot`
+        // TODO(feature/das): need to filter peers by each batch, instead of just `sync_start_slot`
         let filtered_peers_to_sync = peers_to_sync
             .into_iter()
             .filter(|peer_id| {
@@ -355,7 +358,7 @@ impl SyncManager {
                     let custody_columns = self.network_globals.custody_columns();
                     let peer_custody_columns_mapping = self.map_peer_custody_columns(
                         &custody_columns,
-                        start_slot,
+                        max_slot,
                         Some(peer_id),
                         None,
                     );
@@ -779,19 +782,19 @@ impl SyncManager {
 
     pub fn expired_blob_range_batches(
         &mut self,
-    ) -> impl Iterator<Item = (SyncBatch, Instant)> + '_ {
+    ) -> impl Iterator<Item = (RequestId, SyncBatch)> + '_ {
         self.blob_requests.expired_range_batches()
     }
 
     pub fn expired_block_range_batches(
         &mut self,
-    ) -> impl Iterator<Item = (SyncBatch, Instant)> + '_ {
+    ) -> impl Iterator<Item = (RequestId, SyncBatch)> + '_ {
         self.block_requests.expired_range_batches()
     }
 
     pub fn expired_data_column_range_batches(
         &mut self,
-    ) -> impl Iterator<Item = (SyncBatch, Instant)> + '_ {
+    ) -> impl Iterator<Item = (RequestId, SyncBatch)> + '_ {
         self.data_column_requests.expired_range_batches()
     }
 

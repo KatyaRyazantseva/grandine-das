@@ -279,9 +279,8 @@ impl<P: Preset> BlockSyncService<P> {
                             features::log!(DebugP2p, "peer {peer_id} responded on request_id: {request_id} with error: {error:?}");
 
                             if !self.is_forward_synced {
-                                let batches_to_retry = if let RPCError::ErrorResponse(code, reason) = error {
-                                    features::log!(DebugP2p, "{code}: due to {reason} on request_id: {request_id}");
-                                    self.sync_manager.get_request_by_id(request_id).map_or(vec![], |batch| vec![batch])
+                                let batches_to_retry = if let RPCError::ErrorResponse(_code, _reason) = error {
+                                    self.sync_manager.get_request_by_id(request_id).map_or(vec![], |batch| vec![(request_id, batch)])
                                 } else {
                                     self.sync_manager.remove_peer(&peer_id)
                                 };
@@ -405,45 +404,63 @@ impl<P: Preset> BlockSyncService<P> {
         Ok(())
     }
 
-    pub fn retry_sync_batches(&mut self, batches: Vec<SyncBatch>) -> Result<()> {
-        let new_batches = batches
+    pub fn retry_sync_batches(&mut self, batches: Vec<(RequestId, SyncBatch)>) -> Result<()> {
+        let new_batches_with_request_id = batches
             .into_iter()
-            .filter_map(|b| {
-                match b.target {
+            .filter_map(|(request_id, batch)| {
+                let target = batch.target.clone();
+                let SyncBatch {
+                    start_slot,
+                    count,
+                    direction,
+                    peer_id,
+                    ..
+                } = batch;
+                let max_slot = start_slot + count - 1;
+
+                match target {
                     // TODO(feature/das): we should reconstruct the batch by:
                     // - [ ] filter out the columns that are already received or accepted,
                     // - [x] filter out peer that are their head slot is less than start slot
                     SyncTarget::DataColumnSidecar(columns) => Some(
                         self.sync_manager
-                            .map_peer_custody_columns(&columns, b.start_slot, None, Some(b.peer_id))
+                            .map_peer_custody_columns(&columns, max_slot, None, Some(peer_id))
                             .into_iter()
-                            .map(|(peer_id, peer_custody_columns)| SyncBatch {
-                                target: SyncTarget::DataColumnSidecar(peer_custody_columns),
-                                direction: b.direction,
-                                peer_id,
-                                start_slot: b.start_slot,
-                                count: b.count,
+                            .map(|(new_peer_id, peer_custody_columns)| {
+                                (
+                                    request_id,
+                                    SyncBatch {
+                                        target: SyncTarget::DataColumnSidecar(peer_custody_columns),
+                                        direction,
+                                        peer_id: new_peer_id,
+                                        start_slot,
+                                        count,
+                                    },
+                                )
                             })
                             .collect_vec(),
                     ),
                     SyncTarget::Block | SyncTarget::BlobSidecar => self
                         .sync_manager
-                        .random_peer_with_head_slot_filtered(b.start_slot)
-                        .map(|peer_id| {
-                            vec![SyncBatch {
-                                target: b.target,
-                                direction: b.direction,
-                                peer_id,
-                                start_slot: b.start_slot,
-                                count: b.count,
-                            }]
+                        .random_peer_with_head_slot_filtered(max_slot)
+                        .map(|new_peer_id| {
+                            vec![(
+                                request_id,
+                                SyncBatch {
+                                    target,
+                                    direction,
+                                    peer_id: new_peer_id,
+                                    start_slot,
+                                    count,
+                                },
+                            )]
                         }),
                 }
             })
             .flatten()
             .collect_vec();
 
-        for batch in new_batches {
+        for (old_request_id, batch) in new_batches_with_request_id {
             let request_id = self.request_id()?;
             let target = batch.target.clone();
             let SyncBatch {
@@ -470,29 +487,20 @@ impl<P: Preset> BlockSyncService<P> {
                 }
             }
 
-            self.sync_manager.retry_batch(request_id, batch);
+            self.sync_manager
+                .retry_batch(old_request_id, request_id, batch);
         }
 
         Ok(())
     }
 
     fn request_expired_blob_range_requests(&mut self) -> Result<()> {
-        let expired_batches = self
-            .sync_manager
-            .expired_blob_range_batches()
-            .map(|(batch, _)| batch)
-            .collect();
-
+        let expired_batches = self.sync_manager.expired_blob_range_batches().collect();
         self.retry_sync_batches(expired_batches)
     }
 
     fn request_expired_block_range_requests(&mut self) -> Result<()> {
-        let expired_batches = self
-            .sync_manager
-            .expired_block_range_batches()
-            .map(|(batch, _)| batch)
-            .collect();
-
+        let expired_batches = self.sync_manager.expired_block_range_batches().collect();
         self.retry_sync_batches(expired_batches)
     }
 
@@ -500,9 +508,7 @@ impl<P: Preset> BlockSyncService<P> {
         let expired_batches = self
             .sync_manager
             .expired_data_column_range_batches()
-            .map(|(batch, _)| batch)
             .collect();
-
         self.retry_sync_batches(expired_batches)
     }
 

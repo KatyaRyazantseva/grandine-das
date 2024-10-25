@@ -1150,33 +1150,38 @@ impl<P: Preset> Network<P> {
             })?;
 
         let controller = self.controller.clone_arc();
+        let current_slot = controller.head_slot();
+        let config = controller.chain_config();
+        let blobs_serve_range_slot = misc::blob_serve_range_slot::<P>(config, current_slot);
+
         let network_to_service_tx = self.network_to_service_tx.clone();
 
         let connected_peers = self.network_globals.connected_peers();
         let target_peers = self.target_peers;
 
-        self.dedicated_executor
-            .spawn(async move {
-                let blob_sidecars = controller.blob_sidecars_by_range(start_slot..end_slot)?;
+        if start_slot < blobs_serve_range_slot {
+            log(
+                Level::Debug,
+                connected_peers,
+                target_peers,
+                format_args!(
+                    "sending BlobSidecarsByRange response with resource unavailable error \
+                    (peer_request_id: {peer_request_id:?}, peer_id: {peer_id})",
+                ),
+            );
 
-                if blob_sidecars.is_empty() {
-                    log(
-                        Level::Warn,
-                        connected_peers,
-                        target_peers,
-                        format_args!(
-                            "sending BlobSidecarsByRange response with resource unavailable error \
-                            (peer_request_id: {peer_request_id:?}, peer_id: {peer_id})",
-                        ),
-                    );
+            ServiceInboundMessage::SendErrorResponse(
+                peer_id,
+                peer_request_id,
+                RPCResponseErrorCode::ResourceUnavailable,
+                "Requested blob sidecars are not available",
+            )
+            .send(&network_to_service_tx);
+        } else {
+            self.dedicated_executor
+                .spawn(async move {
+                    let blob_sidecars = controller.blob_sidecars_by_range(start_slot..end_slot)?;
 
-                    ServiceInboundMessage::SendErrorResponse(
-                        peer_id,
-                        peer_request_id,
-                        RPCResponseErrorCode::ResourceUnavailable,
-                        "Requested blob sidecars are not available",
-                    ).send(&network_to_service_tx);
-                } else {
                     for blob_sidecar in blob_sidecars {
                         log(
                             Level::Debug,
@@ -1209,11 +1214,11 @@ impl<P: Preset> Network<P> {
                         Box::new(Response::BlobsByRange(None)),
                     )
                     .send(&network_to_service_tx);
-                }
 
-                Ok::<_, anyhow::Error>(())
-            })
-            .detach();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .detach();
+        }
 
         Ok(())
     }
@@ -1320,7 +1325,11 @@ impl<P: Preset> Network<P> {
             .min(MaxRequestDataColumnSidecars::U64)
             .min(MAX_FOR_DOS_PREVENTION);
 
-        let current_slot = self.controller.head_slot();
+        let current_slot = controller.head_slot();
+        let config = controller.chain_config();
+        let data_column_serve_range_slot =
+            misc::data_column_serve_range_slot::<P>(config, current_slot);
+
         let end_slot = start_slot
             .checked_add(difference)
             .ok_or(Error::EndSlotOverflow {
@@ -1333,28 +1342,29 @@ impl<P: Preset> Network<P> {
         let connected_peers = self.network_globals.connected_peers();
         let target_peers = self.target_peers;
 
-        self.dedicated_executor
-            .spawn(async move {
-                let mut data_column_sidecars = controller.data_column_sidecars_by_range(start_slot..end_slot, &columns)?;
+        if start_slot < data_column_serve_range_slot {
+            log(
+                Level::Debug,
+                connected_peers,
+                target_peers,
+                format_args!(
+                    "sending DataColumnsSidecarsByRange response with resource unavailable error \
+                    (peer_request_id: {peer_request_id:?}, peer_id: {peer_id})",
+                ),
+            );
 
-                if data_column_sidecars.is_empty() {
-                    log(
-                        Level::Warn,
-                        connected_peers,
-                        target_peers,
-                        format_args!(
-                            "sending DataColumnsSidecarsByRange response with resource unavailable error \
-                            (peer_request_id: {peer_request_id:?}, peer_id: {peer_id})",
-                        ),
-                    );
+            ServiceInboundMessage::SendErrorResponse(
+                peer_id,
+                peer_request_id,
+                RPCResponseErrorCode::ResourceUnavailable,
+                "Requested data column sidecars are not available",
+            )
+            .send(&network_to_service_tx);
+        } else {
+            self.dedicated_executor
+                .spawn(async move {
+                    let mut data_column_sidecars = controller.data_column_sidecars_by_range(start_slot..end_slot, &columns)?;
 
-                    ServiceInboundMessage::SendErrorResponse(
-                        peer_id,
-                        peer_request_id,
-                        RPCResponseErrorCode::ResourceUnavailable,
-                        "Requested data column sidecars are not available",
-                    ).send(&network_to_service_tx);
-                } else {
                     // The following data column sidecars, where they exist, MUST be sent in (slot, column_index) order.
                     data_column_sidecars.sort_by_key(|sidecar| (sidecar.slot(), sidecar.index));
 
@@ -1390,11 +1400,11 @@ impl<P: Preset> Network<P> {
                         Box::new(Response::DataColumnsByRange(None)),
                     )
                     .send(&network_to_service_tx);
-                }
 
-                Ok::<_, anyhow::Error>(())
-            })
-            .detach();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .detach();
+        }
 
         Ok(())
     }
@@ -1687,14 +1697,6 @@ impl<P: Preset> Network<P> {
                 let data_column_identifier = data_column_sidecar.as_ref().into();
 
                 self.log(
-                    Level::Info,
-                    format_args!(
-                        "received DataColumnsByRange response chunk \
-                        (request_id: {request_id}, peer_id: {peer_id}, slot: {data_column_sidecar_slot}, data_column: {data_column_identifier:?})",
-                    ),
-                );
-
-                self.log(
                     Level::Debug,
                     format_args!(
                         "received DataColumnsByRange response chunk \
@@ -1721,14 +1723,6 @@ impl<P: Preset> Network<P> {
             Response::DataColumnsByRoot(Some(data_column_sidecar)) => {
                 let data_column_sidecar_slot = data_column_sidecar.signed_block_header.message.slot;
                 let data_column_identifier = data_column_sidecar.as_ref().into();
-
-                self.log(
-                    Level::Info,
-                    format_args!(
-                        "received DataColumnsByRoot response chunk \
-                        (request_id: {request_id}, peer_id: {peer_id}, slot: {data_column_sidecar_slot}, data_column: {data_column_identifier:?})",
-                    ),
-                );
 
                 self.log(
                     Level::Debug,
