@@ -1,7 +1,7 @@
 use core::{fmt::Display, hash::Hash, ops::Range, time::Duration};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use anyhow::Result;
+use anyhow::{Error as AnyError, Result};
 use arithmetic::NonZeroExt as _;
 use cached::{Cached as _, TimedSizedCache};
 use eth2_libp2p::{rpc::StatusMessage, NetworkGlobals, PeerId};
@@ -10,6 +10,7 @@ use itertools::Itertools;
 use log::{log, Level};
 use prometheus_metrics::Metrics;
 use rand::{prelude::SliceRandom, seq::IteratorRandom as _, thread_rng};
+use thiserror::Error;
 use typenum::Unsigned as _;
 use types::{
     config::Config,
@@ -174,17 +175,7 @@ impl SyncManager {
         state_slot: Slot,
         low_slot: Slot,
     ) -> Vec<SyncBatch> {
-        // TODO: filter out peers with less head slot
-        let Some(peers_to_sync) = self.find_peers_to_sync().map(|peers| {
-            peers
-                .into_iter()
-                .filter(|peer_id| {
-                    self.peers
-                        .get(&peer_id)
-                        .map_or(false, |peer| peer.head_slot >= state_slot)
-                })
-                .collect_vec()
-        }) else {
+        let Some(peers_to_sync) = self.find_peers_to_sync() else {
             return vec![];
         };
 
@@ -236,24 +227,6 @@ impl SyncManager {
         local_head_slot: Slot,
         local_finalized_slot: Slot,
     ) -> Result<Vec<SyncBatch>> {
-        // TODO: filter out peers with less head slot
-        let Some(peers_to_sync) = self.find_peers_to_sync() else {
-            return Ok(vec![]);
-        };
-
-        let Some(remote_head_slot) = self.max_remote_head_slot(&peers_to_sync) else {
-            return Ok(vec![]);
-        };
-
-        if remote_head_slot <= local_head_slot {
-            self.log_with_feature(format_args!(
-                "remote peers have no new slots \
-                 (local_head_slot: {local_head_slot}, remote_head_slot: {remote_head_slot})",
-            ));
-
-            return Ok(vec![]);
-        }
-
         let slots_per_request = P::SlotsPerEpoch::non_zero().get() * EPOCHS_PER_REQUEST;
 
         let mut redownloads_increased = false;
@@ -280,16 +253,23 @@ impl SyncManager {
             }
         };
 
-        // filter out peers with less head slot than `sync_start_slot`
-        // TODO(feature/das): need to filter peers by each batch, instead of just `sync_start_slot`
-        let filtered_peers_to_sync = peers_to_sync
-            .into_iter()
-            .filter(|peer_id| {
-                self.peers
-                    .get(&peer_id)
-                    .map_or(false, |peer| peer.head_slot >= sync_start_slot)
-            })
-            .collect_vec();
+        let Some(peers_to_sync) = self.find_peers_to_sync_with_head_slot_filtered(sync_start_slot)
+        else {
+            return Ok(vec![]);
+        };
+
+        let Some(remote_head_slot) = self.max_remote_head_slot(&peers_to_sync) else {
+            return Ok(vec![]);
+        };
+
+        if remote_head_slot <= local_head_slot {
+            self.log_with_feature(format_args!(
+                "remote peers have no new slots \
+                 (local_head_slot: {local_head_slot}, remote_head_slot: {remote_head_slot})",
+            ));
+
+            return Ok(vec![]);
+        }
 
         self.log_with_feature(format_args!(
             "sequential redownloads: {}",
@@ -322,11 +302,16 @@ impl SyncManager {
         }
 
         let slot_distance = remote_head_slot.saturating_sub(sync_start_slot);
-        let batches_in_front = usize::try_from(slot_distance / slots_per_request + 1)?;
+        let batches_in_front =
+            usize::try_from(slot_distance / slots_per_request + 1).map_err(|error| {
+                Error::TypeConversionFailed {
+                    error: error.into(),
+                }
+            })?;
         let mut max_slot = local_head_slot;
 
         let mut sync_batches = vec![];
-        for (peer_id, index) in Self::peer_sync_batch_assignments(&filtered_peers_to_sync)
+        for (peer_id, index) in Self::peer_sync_batch_assignments(&peers_to_sync)
             .zip(0..)
             .take(batches_in_front)
         {
@@ -358,10 +343,10 @@ impl SyncManager {
                     let custody_columns = self.network_globals.custody_columns();
                     let peer_custody_columns_mapping = self.map_peer_custody_columns(
                         &custody_columns,
-                        max_slot,
+                        start_slot,
                         Some(peer_id),
                         None,
-                    );
+                    )?;
 
                     for (peer_id, columns) in peer_custody_columns_mapping {
                         sync_batches.push(SyncBatch {
@@ -604,6 +589,19 @@ impl SyncManager {
         })
     }
 
+    fn find_peers_to_sync_with_head_slot_filtered(
+        &mut self,
+        min_head_slot: Slot,
+    ) -> Option<Vec<PeerId>> {
+        self.find_chain_to_sync().map(|chain_id| {
+            let peers_to_sync = self.chain_peers_with_head_slot_filtered(&chain_id, &min_head_slot);
+
+            self.log_with_feature(format_args!("peers to sync count: {}", peers_to_sync.len()));
+
+            peers_to_sync
+        })
+    }
+
     fn find_chain_to_sync(&mut self) -> Option<ChainId> {
         match self.chain_with_max_peer_count() {
             Some(chain_id) => {
@@ -653,16 +651,6 @@ impl SyncManager {
 
     fn chain_peers_shuffled(&self, chain_id: &ChainId) -> Vec<PeerId> {
         let mut peers = self.chain_peers(chain_id);
-        peers.shuffle(&mut thread_rng());
-        peers
-    }
-
-    fn chain_peers_shuffled_with_head_slot_filtered(
-        &self,
-        chain_id: &ChainId,
-        min_head_slot: &Slot,
-    ) -> Vec<PeerId> {
-        let mut peers = self.chain_peers_with_head_slot_filtered(chain_id, min_head_slot);
         peers.shuffle(&mut thread_rng());
         peers
     }
@@ -721,8 +709,9 @@ impl SyncManager {
         column_index: ColumnIndex,
         min_head_slot: Slot,
         prioritized_peer: Option<PeerId>,
+        ignore_peer: Option<PeerId>,
     ) -> Option<PeerId> {
-        let custodial_peers = self
+        let mut custodial_peers = self
             .get_custodial_peers(column_index)
             .into_iter()
             .filter(|peer_id| {
@@ -732,6 +721,15 @@ impl SyncManager {
             })
             .collect_vec();
 
+        // `ingore_peer` is often the previous requested peer that failed to response the request, or response
+        // with an RPC error, which might not able to response to the request again, the peer
+        // will be ignored from this request
+        if let Some(peer) = ignore_peer {
+            custodial_peers.retain(|&p| p != peer);
+        }
+
+        // `prioritized_peer` is often the block proposer, which should have all or at least
+        // required custody columns
         if let Some(peer) = prioritized_peer {
             if custodial_peers.contains(&peer) {
                 return prioritized_peer;
@@ -747,28 +745,21 @@ impl SyncManager {
         min_head_slot: Slot,
         prioritized_peer: Option<PeerId>,
         ignore_peer: Option<PeerId>,
-    ) -> HashMap<PeerId, Vec<ColumnIndex>> {
+    ) -> Result<HashMap<PeerId, Vec<ColumnIndex>>> {
         let mut peer_columns_mapping = HashMap::new();
 
         for column_index in custody_columns {
-            let Some(custodial_peer) =
-                self.get_random_custodial_peer(*column_index, min_head_slot, prioritized_peer)
-            else {
-                // TODO(feature/das): this should return no custody column error, rather than warning
-                self.log(
-                    Level::Warn,
-                    format_args!("No custodial peer for column_index: {column_index} with head slot greater than {min_head_slot}"),
-                );
-                continue;
-            };
-
-            // given peer_id to ignore from retry batch to the same peer again,
-            // which was not able to response to the request
-            if let Some(peer) = ignore_peer {
-                if peer == custodial_peer {
-                    continue;
-                }
-            }
+            let custodial_peer = self
+                .get_random_custodial_peer(
+                    *column_index,
+                    min_head_slot,
+                    prioritized_peer,
+                    ignore_peer,
+                )
+                .ok_or(Error::NoCustodyPeers {
+                    column_index: *column_index,
+                    min_head_slot,
+                })?;
 
             let peer_custody_columns = peer_columns_mapping
                 .entry(custodial_peer)
@@ -777,7 +768,7 @@ impl SyncManager {
             peer_custody_columns.push(*column_index);
         }
 
-        peer_columns_mapping
+        Ok(peer_columns_mapping)
     }
 
     pub fn expired_blob_range_batches(
@@ -846,6 +837,17 @@ impl SyncManager {
         self.block_requests.track_collection_metrics(metrics);
         self.data_column_requests.track_collection_metrics(metrics);
     }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum Error {
+    #[error("No custodial peer for column_index: {column_index} with head slot greater than {min_head_slot}")]
+    NoCustodyPeers {
+        column_index: ColumnIndex,
+        min_head_slot: Slot,
+    },
+    #[error("Type conversion is incorrect")]
+    TypeConversionFailed { error: AnyError },
 }
 
 #[cfg(test)]

@@ -285,7 +285,6 @@ impl<P: Preset> BlockSyncService<P> {
                                     self.sync_manager.remove_peer(&peer_id)
                                 };
 
-                                // TODO(feature/das): retry the batch request
                                 if self.retry_sync_batches(batches_to_retry).is_err() {
                                     features::log!(DebugP2p, "Batch could not retired when request failed");
                                 }
@@ -416,33 +415,37 @@ impl<P: Preset> BlockSyncService<P> {
                     peer_id,
                     ..
                 } = batch;
-                let max_slot = start_slot + count - 1;
 
                 match target {
                     // TODO(feature/das): we should reconstruct the batch by:
                     // - [ ] filter out the columns that are already received or accepted,
                     // - [x] filter out peer that are their head slot is less than start slot
-                    SyncTarget::DataColumnSidecar(columns) => Some(
-                        self.sync_manager
-                            .map_peer_custody_columns(&columns, max_slot, None, Some(peer_id))
-                            .into_iter()
-                            .map(|(new_peer_id, peer_custody_columns)| {
-                                (
-                                    request_id,
-                                    SyncBatch {
-                                        target: SyncTarget::DataColumnSidecar(peer_custody_columns),
-                                        direction,
-                                        peer_id: new_peer_id,
-                                        start_slot,
-                                        count,
-                                    },
-                                )
-                            })
-                            .collect_vec(),
-                    ),
+                    SyncTarget::DataColumnSidecar(columns) => self
+                        .sync_manager
+                        .map_peer_custody_columns(&columns, start_slot, None, Some(peer_id))
+                        .map(|peer_custody_columns_mapping| {
+                            peer_custody_columns_mapping
+                                .into_iter()
+                                .map(|(new_peer_id, peer_custody_columns)| {
+                                    (
+                                        request_id,
+                                        SyncBatch {
+                                            target: SyncTarget::DataColumnSidecar(
+                                                peer_custody_columns,
+                                            ),
+                                            direction,
+                                            peer_id: new_peer_id,
+                                            start_slot,
+                                            count,
+                                        },
+                                    )
+                                })
+                                .collect_vec()
+                        })
+                        .ok(),
                     SyncTarget::Block | SyncTarget::BlobSidecar => self
                         .sync_manager
-                        .random_peer_with_head_slot_filtered(max_slot)
+                        .random_peer_with_head_slot_filtered(start_slot)
                         .map(|new_peer_id| {
                             vec![(
                                 request_id,
@@ -629,7 +632,7 @@ impl<P: Preset> BlockSyncService<P> {
         let columns_indices = identifiers.iter().map(|id| id.index).collect();
         let peer_custody_columns_mapping =
             self.sync_manager
-                .map_peer_custody_columns(&columns_indices, slot, peer_id, None);
+                .map_peer_custody_columns(&columns_indices, slot, peer_id, None)?;
 
         for (peer_id, columns) in peer_custody_columns_mapping {
             if !columns.is_empty() {

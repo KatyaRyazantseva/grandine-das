@@ -378,7 +378,7 @@ impl<P: Preset> Network<P> {
                         }
                         P2pMessage::DataColumnsReconstructed(data_column_sidecars, slot) => {
                             self.log(
-                                Level::Info,
+                                Level::Debug,
                                 format_args!(
                                     "propagating data column sidecars after reconstructed (indexes: [{}], slot: {slot})",
                                     data_column_sidecars.iter().map(|c| c.index).join(", "),
@@ -625,7 +625,14 @@ impl<P: Preset> Network<P> {
 
         self.log(
             Level::Debug,
-            format_args!("publishing data column sidecars: {messages:?}"),
+            format_args!(
+                "publishing [{}]",
+                messages
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         );
 
         self.publish_batch(messages);
@@ -1230,7 +1237,7 @@ impl<P: Preset> Network<P> {
         request: DataColumnsByRootRequest,
     ) {
         self.log(
-            Level::Info,
+            Level::Debug,
             format_args!(
                 "received DataColumnsByRoot request (peer_id: {peer_id}, request: {request:?})"
             ),
@@ -1299,7 +1306,7 @@ impl<P: Preset> Network<P> {
         request: DataColumnsByRangeRequest,
     ) -> Result<()> {
         self.log(
-            Level::Info,
+            Level::Debug,
             format_args!(
                 "received DataColumnsByRange request (peer_id: {peer_id}, request: {request:?})"
             ),
@@ -1832,9 +1839,11 @@ impl<P: Preset> Network<P> {
                 }
 
                 let (subnet_id, data_column_sidecar) = *data;
+                let data_column_identifier: DataColumnIdentifier =
+                    data_column_sidecar.as_ref().into();
 
                 self.log_with_feature(format_args!(
-                    "received data column sidecar as gossip in subnet {subnet_id}: {data_column_sidecar:?} from {source}",
+                    "received data column sidecar as gossip in subnet {subnet_id}: {data_column_identifier:?} from {source}",
                 ));
 
                 let chain_config = self.controller.chain_config().as_ref();
@@ -2358,17 +2367,6 @@ impl<P: Preset> Network<P> {
     }
 
     fn publish_batch(&self, messages: Vec<PubsubMessage<P>>) {
-        self.log(
-            Level::Info,
-            format_args!(
-                "publishing [{}]",
-                messages
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        );
         ServiceInboundMessage::PublishBatch(messages).send(&self.network_to_service_tx);
     }
 
