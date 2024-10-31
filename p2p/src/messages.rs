@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::Result;
 use bls::PublicKeyBytes;
 use eth2_libp2p::{
-    rpc::{GoodbyeReason, StatusMessage},
+    rpc::{GoodbyeReason, RPCError, RPCResponseErrorCode, StatusMessage},
     types::{EnrForkId, GossipKind},
     GossipId, GossipTopic, MessageAcceptance, NetworkEvent, PeerAction, PeerId, PeerRequestId,
     PubsubMessage, ReportSource, Request, Response, Subnet, SubnetDiscovery,
@@ -16,7 +16,7 @@ use types::{
     altair::containers::{SignedContributionAndProof, SyncCommitteeMessage},
     combined::{BeaconState, SignedBeaconBlock},
     deneb::containers::{BlobIdentifier, BlobSidecar},
-    eip7594::{DataColumnIdentifier, DataColumnSidecar},
+    eip7594::{ColumnIndex, DataColumnIdentifier, DataColumnSidecar},
     nonstandard::Phase,
     phase0::{
         containers::{
@@ -67,7 +67,7 @@ pub enum P2pToSync<P: Preset> {
     BlocksByRangeRequestFinished(RequestId),
     BlockByRootRequestFinished(H256),
     DataColumnsByRangeRequestFinished(RequestId),
-    RequestFailed(PeerId),
+    RequestFailed(PeerId, RequestId, RPCError),
     DataColumnsByRootChunkReceived(DataColumnIdentifier, PeerId, RequestId),
 }
 
@@ -129,7 +129,7 @@ impl SyncToMetrics {
 
 pub enum SyncToP2p {
     PruneReceivedBlocks,
-    RequestDataColumnsByRange(RequestId, PeerId, Slot, u64),
+    RequestDataColumnsByRange(RequestId, PeerId, Slot, u64, Vec<ColumnIndex>),
     RequestDataColumnsByRoot(RequestId, PeerId, Vec<DataColumnIdentifier>),
     RequestBlobsByRange(RequestId, PeerId, Slot, u64),
     RequestBlobsByRoot(RequestId, PeerId, Vec<BlobIdentifier>),
@@ -222,6 +222,7 @@ pub enum ServiceInboundMessage<P: Preset> {
     ReportMessageValidationResult(GossipId, MessageAcceptance),
     SendRequest(PeerId, RequestId, Request),
     SendResponse(PeerId, PeerRequestId, Box<Response<P>>),
+    SendErrorResponse(PeerId, PeerRequestId, RPCResponseErrorCode, &'static str),
     Subscribe(GossipTopic),
     SubscribeKind(GossipKind),
     SubscribeNewForkTopics(Phase, ForkDigest),
